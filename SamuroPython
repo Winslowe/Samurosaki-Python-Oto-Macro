@@ -1,0 +1,832 @@
+import subprocess
+import sys
+import tkinter as tk
+from tkinter import messagebox, Toplevel, ttk
+import time
+import threading
+import socket
+import json
+import os
+import psutil
+from datetime import datetime
+import ctypes
+import requests
+import customtkinter as ctk
+import base64
+import hashlib
+
+# --- UYGULAMA BİLGİLERİ ---
+APP_NAME = "Samurosaki"
+APP_VERSION = "18.1"
+# Uzak Sunucu/Localhost bağlantı denemeleri için kritik: Timeout 3 saniye.
+UPDATE_SERVER_URL = "http://localhost:8080/version_check.json" 
+ACTIVE_USERS_URL = "http://localhost/active_users_count.php" 
+DATA_FILE = "app_data.json"
+
+# --- GEREKLİ KÜTÜPHANELER VE KURULUM FONKSİYONLARI ---
+REQUIRED_PACKAGES = {
+    'customtkinter': 'customtkinter',
+    'psutil': 'psutil',
+    'requests': 'requests',
+    'pydirectinput': 'pydirectinput',
+    'pywin32': 'pywin32'
+}
+CRITICAL_PACKAGES = ['pydirectinput', 'pywin32']
+
+def restart_program():
+    """Uygulamayı mevcut parametrelerle yeniden başlatır."""
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+    
+def install_package(package_name, display_name, progress_callback):
+    """Belirtilen Python paketini pip ile kurar."""
+    progress_callback(f"📦 Kurulum Başladı: {display_name}...")
+    try:
+        time.sleep(1) 
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name], 
+                              stdout=subprocess.DEVNULL, 
+                              stderr=subprocess.DEVNULL)
+        progress_callback(f"✅ {display_name} kuruldu.")
+        return True
+    except subprocess.CalledProcessError:
+        progress_callback(f"❌ HATA: {display_name} kurulamadı. Pip erişimini veya internet bağlantısını kontrol edin.")
+        return False
+    except FileNotFoundError:
+        progress_callback("❌ HATA: Pip bulunamadı. Python kurulumunu kontrol edin.")
+        return False
+
+# --- Kütüphane Kontrolü ve Yüklenmesi (Koşullu Başlangıç) ---
+MISSING_CRITICAL = []
+try:
+    # Win32 bileşenlerini dene
+    import win32gui
+    import win32con
+    import win32api
+    import pydirectinput
+    
+    _AllowSetForegroundWindow = ctypes.windll.user32.AllowSetForegroundWindow
+    _AllowSetForegroundWindow.argtypes = [ctypes.c_int]
+    _AllowSetForegroundWindow.restype = ctypes.c_bool
+    _GetCurrentProcessId = ctypes.windll.kernel32.GetCurrentProcessId
+    _GetCurrentProcessId.restype = ctypes.c_int
+    KEYEVENTF_KEYUP = 0x0002
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    
+except ImportError as e:
+    missing_name = str(e).split("'")[1]
+    if missing_name in CRITICAL_PACKAGES:
+        MISSING_CRITICAL.append(missing_name)
+    # Diğer gerekli kütüphaneler için kontrol
+    for pkg, name in REQUIRED_PACKAGES.items():
+        try: __import__(pkg)
+        except ImportError:
+            if pkg not in MISSING_CRITICAL: MISSING_CRITICAL.append(pkg)
+
+if MISSING_CRITICAL:
+    class InstallerApp(ctk.CTk):
+        def __init__(self, missing_packages):
+            super().__init__()
+            self.title(f"{APP_NAME} | Kurulum Gerekiyor")
+            self.geometry("600x400")
+            self.resizable(False, False)
+            self.missing_packages = list(set(missing_packages))
+            
+            ctk.CTkLabel(self, text="🚨 Kritik Kütüphaneler Eksik! 🚨", font=("Arial", 24, "bold"), text_color="red").pack(pady=(40, 5))
+            ctk.CTkLabel(self, text="Devam etmek için gerekli Python kütüphanelerini kurmanız gerekiyor.").pack(pady=(0, 20))
+            
+            self.log_text = ctk.CTkTextbox(self, height=150, width=550)
+            self.log_text.pack(pady=10)
+            self.log_text.insert("end", "Kurulacaklar:\n")
+            for pkg in self.missing_packages:
+                self.log_text.insert("end", f"- {pkg}\n")
+            self.log_text.configure(state="disabled")
+            
+            self.btn_install = ctk.CTkButton(self, text="KURULUMU BAŞLAT", command=self.start_install, fg_color="#00FF7F", text_color="black", hover_color="#00D069")
+            self.btn_install.pack(pady=20)
+            
+        def update_progress(self, message):
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+            self.update()
+
+        def start_install(self):
+            self.btn_install.configure(state="disabled", text="KURULUYOR...")
+            self.update_progress("--------------------")
+            
+            install_success = True
+            for pkg in self.missing_packages:
+                if not install_package(pkg, pkg, self.update_progress):
+                    install_success = False
+                    break
+            
+            if install_success:
+                self.update_progress("✅ TÜM KÜTÜPHANELER BAŞARIYLA KURULDU.")
+                messagebox.showinfo("Başarılı", "Kurulum tamamlandı. Uygulama şimdi **otomatik olarak yeniden başlatılacak**.")
+                self.destroy() 
+                restart_program()
+            else:
+                self.update_progress("❌ Kurulum hatası! Uygulama başlatılamıyor.")
+                messagebox.showerror("Hata", "Kütüphane kurulumu başarısız oldu.")
+                self.destroy()
+                sys.exit(1)
+
+    if MISSING_CRITICAL:
+        app = InstallerApp(MISSING_CRITICAL)
+        app.mainloop()
+        sys.exit(0) 
+
+# --- GÜVENLİK VE HWID FONKSİYONLARI ---
+def generate_hwid():
+    """Basit ve benzersiz bir HWID oluşturur."""
+    try:
+        disk_serial = subprocess.check_output('wmic diskdrive get serialnumber').decode().strip().split('\n')[1].strip()
+    except:
+        disk_serial = f"{os.getlogin()}-{socket.gethostname()}-{psutil.cpu_freq().max:.0f}"
+    return hashlib.sha256(disk_serial.encode()).hexdigest()
+
+CURRENT_HWID = generate_hwid()
+
+# --- TUŞ KODLARI VE GİRİŞ FONKSİYONLARI ---
+VK_CODES = {
+    'e': 0x45, 'a': 0x41, 'b': 0x42, 'c': 0x43, 'd': 0x44, 'f': 0x46, 'g': 0x47, 'h': 0x48, 
+    'i': 0x49, 'j': 0x4A, 'k': 0x4B, 'l': 0x4C, 'm': 0x4D, 'n': 0x4E, 'o': 0x4F, 'p': 0x50, 
+    'q': 0x51, 'r': 0x52, 's': 0x53, 't': 0x54, 'u': 0x55, 'v': 0x56, 'w': 0x57, 'x': 0x58, 
+    'y': 0x59, 'z': 0x5A, '1': 0x31, '2': 0x32, '3': 0x33, '4': 0x34, '5': 0x35, '6': 0x36, 
+    '7': 0x37, '8': 0x38, '9': 0x39, '0': 0x30,
+    'enter': win32con.VK_RETURN, 'space': win32con.VK_SPACE, 'tab': win32con.VK_TAB, 
+    'f1': win32con.VK_F1, 'f10': win32con.VK_F10,
+    'shift': win32con.VK_SHIFT, 'ctrl': win32con.VK_CONTROL, 'alt': win32con.VK_MENU, 
+    'esc': win32con.VK_ESCAPE, 'up': win32con.VK_UP, 'left': win32con.VK_LEFT, 
+    'right': win32con.VK_RIGHT, 'down': win32con.VK_DOWN
+}
+
+def direct_click(key_str):
+    """Mod 2: ODAKLI İÇİ (pydirectinput)"""
+    try: pydirectinput.press(key_str); return True
+    except Exception: return False
+        
+def aggressive_afk_click(target_hwnd, key_str):
+    """Mod 1: AGRESİF AFK (Pencereyi öne getirir)"""
+    try:
+        vk_code = VK_CODES.get(key_str.lower())
+        if not vk_code: return False
+        current_hwnd = win32gui.GetForegroundWindow()
+        _AllowSetForegroundWindow(_GetCurrentProcessId()) 
+        win32gui.SetForegroundWindow(target_hwnd)
+        time.sleep(0.1) 
+        win32api.keybd_event(vk_code, 0, 0, 0) 
+        time.sleep(0.05) 
+        win32api.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0) 
+        time.sleep(0.1) 
+        if current_hwnd and win32gui.IsWindow(current_hwnd) and win32gui.IsWindowVisible(current_hwnd):
+             win32gui.SetForegroundWindow(current_hwnd)
+        return True
+    except Exception:
+        return False
+
+def passive_afk_click(target_hwnd, key_str):
+    """Mod 3: PASİF AFK (PostMessage)"""
+    try:
+        vk_code = VK_CODES.get(key_str.lower())
+        if not vk_code: return False
+        scan_code = win32api.MapVirtualKey(vk_code, 0)
+        
+        # PostMessage
+        lparam_down = scan_code << 1
+        lparam_up = scan_code << 1 | 0xC0000000 
+        win32gui.PostMessage(target_hwnd, WM_KEYDOWN, vk_code, lparam_down)
+        time.sleep(0.05) 
+        win32gui.PostMessage(target_hwnd, WM_KEYUP, vk_code, lparam_up)
+        return True
+    except Exception:
+        return False
+
+# --- XAMPP/Localhost İLE KULLANICI SAYACI FONKSİYONU ---
+def fetch_active_users():
+    try:
+        # Uzak sunucu bağlantıları için kritik: Timeout 3 saniye.
+        response = requests.get(ACTIVE_USERS_URL, timeout=3) 
+        response.raise_for_status()
+        count = int(response.text.strip()) 
+        return count
+    except requests.exceptions.Timeout:
+        return "Zaman Aşımı (3sn)"
+    except requests.exceptions.ConnectionError:
+        return "Bağlantı Hatası" 
+    except ValueError:
+        return "Veri Hatası"
+    except Exception:
+        return "Bilinmeyen Hata"
+
+# --- VERİ YÖNETİMİ VE WEBHOOK ---
+def save_data(data):
+    try:
+        with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=4)
+    except: pass
+
+def load_data():
+    defaults = {
+        "licenses": [{"key": "1234", "status": "Aktif", "hwid": "Yok"}],
+        "webhook_data": [{"url_b64": base64.b64encode("https://example.com/webhook/test".encode()).decode(), "active": False}],
+        "announcement": f"Sisteme Hoşgeldiniz. Sürüm {APP_VERSION}",
+    }
+    if not os.path.exists(DATA_FILE):
+        save_data(defaults)
+        return defaults
+    try:
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+            for k, v in defaults.items():
+                if k not in data: data[k] = v
+            if 'licenses' not in data or not isinstance(data['licenses'], list):
+                data['licenses'] = defaults['licenses']
+            
+            if not any(lic.get('key') == "1234" for lic in data.get('licenses', [])):
+                data.setdefault('licenses', []).append({"key": "1234", "status": "Aktif", "hwid": "Yok"})
+
+            return data
+    except: 
+        save_data(defaults)
+        return defaults
+
+def send_webhook(title, message, data, color=3066993):
+    for wh in data.get('webhook_data', []):
+        if wh.get('active', False) and 'url_b64' in wh:
+            try:
+                url = base64.b64decode(wh['url_b64']).decode()
+            except: continue
+            
+            payload = {
+                "username": f"{APP_NAME} Srv v{APP_VERSION}",
+                "embeds": [{
+                    "title": title,
+                    "description": message,
+                    "color": color, 
+                    "footer": {"text": f"Kullanıcı: {os.getlogin()} | HWID: {CURRENT_HWID[:10]}... | Zaman: {time.strftime('%H:%M:%S')}"}
+                }]
+            }
+            try: requests.post(url, json=payload, timeout=5)
+            except: pass
+
+def create_led(parent, status):
+    color = "#00FF7F" if str(status).lower() in ["aktif", "true"] else "#FF4500"
+    led = ctk.CTkLabel(parent, text="●", font=("Arial", 24), text_color=color)
+    return led
+
+# --- YÖNETİCİ ARAYÜZÜ ÇERÇEVELERİ ---
+class LicenseFrame(ctk.CTkFrame):
+    def __init__(self, parent, controller, data):
+        super().__init__(parent)
+        self.controller = controller
+        self.data = data
+        self.grid_columnconfigure(0, weight=1) 
+        ctk.CTkLabel(self, text="🔑 Lisans Yönetimi", font=("Arial", 28, "bold"), text_color="#00FF7F").pack(pady=(20, 10))
+        ctk.CTkLabel(self, text="Burada kullanıcı lisanslarını yönetebilirsiniz.", text_color="gray", wraplength=700).pack(pady=(0, 15))
+        
+        input_frame = ctk.CTkFrame(self)
+        input_frame.pack(pady=10, padx=20, fill="x")
+        self.key_entry = ctk.CTkEntry(input_frame, placeholder_text="Yeni Lisans Anahtarı", width=300)
+        self.key_entry.pack(side="left", padx=10, pady=5)
+        self.status_var = tk.StringVar(value="Aktif")
+        ctk.CTkComboBox(input_frame, values=["Aktif", "Pasif"], variable=self.status_var, width=120).pack(side="left", padx=10, pady=5)
+        ctk.CTkButton(input_frame, text="Lisans Ekle", command=self.add_license, fg_color="#1E90FF", hover_color="#104E8B").pack(side="left", padx=10, pady=5)
+        
+        self.license_list = ctk.CTkScrollableFrame(self, label_text="Mevcut Lisanslar", height=400)
+        self.license_list.pack(fill="both", expand=True, padx=20, pady=10)
+        self.refresh_data()
+        
+    def add_license(self):
+        key = self.key_entry.get().strip()
+        status = self.status_var.get()
+        if key:
+            self.data.setdefault('licenses', []).append({"key": key, "status": status, "hwid": "Yok"})
+            self.controller.save_data_and_refresh()
+            self.key_entry.delete(0, 'end')
+            self.refresh_data()
+            
+    def toggle_status(self, index):
+        current_status = self.data['licenses'][index]['status']
+        new_status = "Pasif" if current_status == "Aktif" else "Aktif"
+        self.data['licenses'][index]['status'] = new_status
+        self.controller.save_data_and_refresh()
+        self.refresh_data()
+
+    def remove_license(self, index):
+        if 0 <= index < len(self.data.get('licenses', [])):
+            self.data['licenses'].pop(index)
+            self.controller.save_data_and_refresh()
+            self.refresh_data()
+            
+    def refresh_data(self):
+        for widget in self.license_list.winfo_children(): widget.destroy()
+        licenses = self.data.get('licenses', [])
+        
+        for i, lic in enumerate(licenses):
+            row = ctk.CTkFrame(self.license_list, fg_color="gray20", height=40)
+            row.pack(fill="x", padx=5, pady=4)
+            
+            led = create_led(row, lic.get('status', 'Pasif'))
+            led.pack(side="left", padx=(10, 5))
+            
+            hwid_display = f"{lic.get('hwid', 'Yok')[:10]}..." if lic.get('hwid') and lic.get('hwid') != "Yok" else "Yok"
+            info_text = f"Key: {lic.get('key')} | Durum: {lic.get('status')} | HWID: {hwid_display}"
+            ctk.CTkLabel(row, text=info_text, anchor="w", width=500).pack(side="left", padx=10)
+            
+            toggle_text = "Pasif Yap" if lic.get('status') == "Aktif" else "Aktif Yap"
+            toggle_color = "red" if lic.get('status') == "Aktif" else "#00FF7F"
+            ctk.CTkButton(row, text=toggle_text, width=80, fg_color=toggle_color, hover_color=toggle_color, command=lambda idx=i: self.toggle_status(idx)).pack(side="right", padx=5)
+            
+            ctk.CTkButton(row, text="Sil", width=50, fg_color="red", hover_color="#8B0000", command=lambda idx=i: self.remove_license(idx)).pack(side="right", padx=5)
+
+class WebhookFrame(ctk.CTkFrame):
+    def __init__(self, parent, controller, data):
+        super().__init__(parent)
+        self.controller = controller
+        self.data = data
+        self.grid_columnconfigure(0, weight=1) 
+        
+        ctk.CTkLabel(self, text="🔗 Webhook Yönetimi", font=("Arial", 28, "bold"), text_color="#00FF7F").pack(pady=(20, 10))
+        ctk.CTkLabel(self, text="Uygulama olaylarını Discord/Slack'e gönderir.", text_color="gray", wraplength=700).pack(pady=(0, 15))
+        
+        input_frame = ctk.CTkFrame(self)
+        input_frame.pack(pady=10, padx=20, fill="x")
+        
+        self.url_entry = ctk.CTkEntry(input_frame, placeholder_text="Webhook URL", width=500)
+        self.url_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+        
+        ctk.CTkButton(input_frame, text="Ekle", command=self.add_webhook, fg_color="#1E90FF", hover_color="#104E8B").pack(side="left", padx=10, pady=5)
+        
+        self.webhook_list = ctk.CTkScrollableFrame(self, label_text="Kayıtlı Webhooklar", height=400)
+        self.webhook_list.pack(fill="both", expand=True, padx=20, pady=10)
+        self.refresh_data()
+        
+    def add_webhook(self):
+        url = self.url_entry.get().strip()
+        if url and url.startswith("http"):
+            url_b64 = base64.b64encode(url.encode()).decode() 
+            self.data.setdefault('webhook_data', []).append({"url_b64": url_b64, "active": True})
+            self.controller.save_data_and_refresh()
+            self.url_entry.delete(0, 'end')
+            self.refresh_data()
+        else:
+            messagebox.showerror("Hata", "Lütfen geçerli bir URL girin.")
+            
+    def toggle_active(self, index):
+        current_active = self.data['webhook_data'][index].get('active', False)
+        self.data['webhook_data'][index]['active'] = not current_active
+        self.controller.save_data_and_refresh()
+        self.refresh_data()
+
+    def remove_webhook(self, index):
+        if 0 <= index < len(self.data.get('webhook_data', [])):
+            self.data['webhook_data'].pop(index)
+            self.controller.save_data_and_refresh()
+            self.refresh_data()
+            
+    def refresh_data(self):
+        for widget in self.webhook_list.winfo_children(): widget.destroy()
+        webhooks = self.data.get('webhook_data', [])
+        
+        for i, wh in enumerate(webhooks):
+            row = ctk.CTkFrame(self.webhook_list, fg_color="gray20", height=40)
+            row.pack(fill="x", padx=5, pady=4)
+            
+            is_active = wh.get('active', False)
+            try:
+                url = base64.b64decode(wh.get('url_b64', '').encode()).decode() 
+            except:
+                url = "Hatalı URL"
+                
+            led = create_led(row, is_active)
+            led.pack(side="left", padx=(10, 5))
+            
+            status_text = "AKTİF" if is_active else "PASİF"
+            info_text = f"Durum: {status_text} | URL: {url[:60]}..."
+            ctk.CTkLabel(row, text=info_text, anchor="w", width=500).pack(side="left", padx=10)
+            
+            toggle_text = "KAPAT" if is_active else "AÇ"
+            toggle_color = "red" if is_active else "#00FF7F"
+            ctk.CTkButton(row, text=toggle_text, width=60, fg_color=toggle_color, hover_color=toggle_color, command=lambda idx=i: self.toggle_active(idx)).pack(side="right", padx=5)
+            ctk.CTkButton(row, text="Sil", width=50, fg_color="red", hover_color="#8B0000", command=lambda idx=i: self.remove_webhook(idx)).pack(side="right", padx=5)
+
+class AnnouncementFrame(ctk.CTkFrame):
+    def __init__(self, parent, controller, data):
+        super().__init__(parent)
+        self.controller = controller
+        self.data = data
+        self.grid_columnconfigure(0, weight=1)
+        
+        ctk.CTkLabel(self, text="📣 Duyuru Ayarı", font=("Arial", 28, "bold"), text_color="#00FF7F").pack(pady=(20, 10))
+        ctk.CTkLabel(self, text="Kullanıcılara gösterilecek mesajı düzenleyin.", text_color="gray").pack(pady=(0, 15))
+        
+        self.announcement_entry = ctk.CTkEntry(self, height=40)
+        self.announcement_entry.pack(pady=5, padx=20, fill="x")
+        self.announcement_entry.insert(0, self.data.get('announcement', f"Sisteme Hoşgeldiniz. Sürüm {APP_VERSION}"))
+        
+        ctk.CTkButton(self, text="Güncelle", command=self.update_announcement, fg_color="#00FF7F", text_color="black").pack(pady=20, padx=20)
+
+    def update_announcement(self):
+        new_announcement = self.announcement_entry.get().strip()
+        self.data['announcement'] = new_announcement
+        self.controller.save_data_and_refresh(update_announcement=True)
+        messagebox.showinfo("Başarılı", "Duyuru güncellendi.")
+
+class AdminPanel(ctk.CTkToplevel):
+    def __init__(self, master, data):
+        super().__init__(master)
+        self.master = master
+        self.title(f"YÖNETİCİ PANELİ | v{APP_VERSION}")
+        self.geometry("1000x700")
+        self.data = data
+        self.transient(master) 
+        self.grab_set()
+
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+
+        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_rowconfigure(4, weight=1)
+        
+        ctk.CTkLabel(self.sidebar, text="ADMIN", font=("Arial", 20, "bold"), text_color="#00FF7F").grid(row=0, column=0, pady=30, padx=20)
+        
+        self.content = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.content.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
+        self.content.grid_rowconfigure(0, weight=1)
+        self.content.grid_columnconfigure(0, weight=1)
+
+        self.frames = {}
+        for F in (LicenseFrame, WebhookFrame, AnnouncementFrame):
+            page_name = F.__name__
+            frame = F(parent=self.content, controller=self, data=self.data)
+            self.frames[page_name] = frame
+            frame.grid(row=0, column=0, sticky="nsew")
+            
+        self.btn_licenses = ctk.CTkButton(self.sidebar, text="🔑 Lisanslar", fg_color="transparent", command=lambda: self.show_frame("LicenseFrame"))
+        self.btn_licenses.grid(row=1, column=0, pady=10, padx=20, sticky="ew")
+        self.btn_webhooks = ctk.CTkButton(self.sidebar, text="🔗 Webhooklar", fg_color="transparent", command=lambda: self.show_frame("WebhookFrame"))
+        self.btn_webhooks.grid(row=2, column=0, pady=10, padx=20, sticky="ew")
+        self.btn_announcement = ctk.CTkButton(self.sidebar, text="📣 Duyuru", fg_color="transparent", command=lambda: self.show_frame("AnnouncementFrame"))
+        self.btn_announcement.grid(row=3, column=0, pady=10, padx=20, sticky="ew")
+
+        self.show_frame("LicenseFrame") 
+
+    def show_frame(self, page_name):
+        frame = self.frames.get(page_name)
+        if frame:
+            frame.tkraise()
+            if hasattr(frame, 'refresh_data'):
+                frame.data = load_data() 
+                frame.refresh_data()
+        
+    def save_data_and_refresh(self, update_announcement=False):
+        save_data(self.data)
+        if update_announcement and self.master:
+            self.master.update_announce(self.data.get('announcement', ""))
+
+class AdminLogin(ctk.CTkToplevel):
+    def __init__(self, master, data):
+        super().__init__(master)
+        self.master = master
+        self.data = data
+        self.title("Admin Girişi")
+        self.geometry("350x250")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set() 
+        self.bind("<Return>", lambda event: self.check_login())
+        
+        ctk.CTkLabel(self, text="ADMİN GİRİŞİ", font=("Arial", 18, "bold")).pack(pady=20)
+        
+        self.username_entry = ctk.CTkEntry(self, placeholder_text="Kullanıcı Adı", width=200)
+        self.username_entry.pack(pady=5)
+        
+        self.password_entry = ctk.CTkEntry(self, placeholder_text="Şifre", show="*", width=200)
+        self.password_entry.pack(pady=5)
+        
+        ctk.CTkButton(self, text="Giriş Yap", command=self.check_login, fg_color="#00FF7F", text_color="black", hover_color="#00D069").pack(pady=15)
+
+    def check_login(self):
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get().strip()
+        
+        ADMIN_USERS = {
+            "samurosaki1": "samurosaki1", 
+            "hasdi": "124"                
+        }
+        
+        if username in ADMIN_USERS and ADMIN_USERS[username] == password:
+            self.destroy()
+            AdminPanel(self.master, self.data)
+        else:
+            messagebox.showerror("Hata", "Geçersiz bilgiler!")
+
+# --- LİSANS DOĞRULAMA SINIFI ---
+class LoginApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME} Lisans Doğrulama | v{APP_VERSION}")
+        self.geometry("400x500")
+        self.resizable(False, False)
+        
+        ctk.CTkLabel(self, text=APP_NAME, font=("Arial", 24, "bold"), text_color="#00FF7F").pack(pady=(50, 5))
+        ctk.CTkLabel(self, text=f"Lisans Doğrulama | HWID: {CURRENT_HWID[:10]}...", font=("Arial", 12)).pack(pady=(0, 30))
+        
+        self.status = ctk.CTkLabel(self, text="🔑 Lisans Anahtarınızı Girin", text_color="#1E90FF")
+        self.status.pack(pady=10)
+
+        self.key_entry = ctk.CTkEntry(self, placeholder_text="Lisans Anahtarı", width=300, height=40, justify="center")
+        self.key_entry.pack(pady=10)
+        self.key_entry.insert(0, "1234") 
+        
+        self.btn_login = ctk.CTkButton(self, text="GİRİŞ YAP", width=300, height=45, fg_color="#00FF7F", text_color="black", font=("Arial", 14, "bold"), hover_color="#00D069", command=self.check_license)
+        self.btn_login.pack(pady=20)
+        
+        self.data = load_data()
+        self.after_id_update = None 
+        self._start_update_check()
+    
+    def _start_update_check(self):
+        threading.Thread(target=self._check_for_updates_threaded, daemon=True).start()
+        self.after_id_update = self.after(30000, self._start_update_check) 
+
+    def _check_for_updates_threaded(self):
+        try:
+            if not self.winfo_exists(): return # PENCERE YOKSA DUR
+            self.after(0, lambda: self.status.configure(text="🌐 Güncelleme Kontrol Ediliyor...", text_color="#FFA500"))
+            response = requests.get(UPDATE_SERVER_URL, timeout=3) 
+            response.raise_for_status()
+            update_data = response.json()
+            latest_version = update_data.get('version', APP_VERSION)
+
+            if not self.winfo_exists(): return # PENCERE KONTROL 2
+
+            if latest_version > APP_VERSION:
+                self.after(0, lambda: self.status.configure(text=f"🚨 YENİ SÜRÜM MEVCUT: v{latest_version} 🚨", text_color="red"))
+            else:
+                self.after(0, lambda: self.status.configure(text="✅ Sistem Kullanıma Hazır", text_color="#00FF7F"))
+        except:
+            if self.winfo_exists():
+                self.after(0, lambda: self.status.configure(text="⚠️ Güncelleme Sunucusuna Ulaşılamıyor.", text_color="#FFA500"))
+            
+    def check_license(self):
+        key = self.key_entry.get().strip()
+        self.data = load_data() 
+        valid = False
+        
+        if key == "samurosaki1": 
+            valid = True
+        else:
+            for i, lic in enumerate(self.data.get('licenses', [])):
+                if lic.get('key') == key and lic.get('status') == "Aktif":
+                    stored_hwid = lic.get('hwid')
+                    if stored_hwid in ["Yok", CURRENT_HWID]:
+                        valid = True
+                        if stored_hwid != CURRENT_HWID:
+                            self.data['licenses'][i]['hwid'] = CURRENT_HWID
+                            save_data(self.data)
+                        break
+                    else:
+                        self.status.configure(text="⚠️ Lisans Başka Bir Bilgisayara Bağlı!", text_color="red")
+                        return
+        
+        if valid:
+            if self.after_id_update is not None:
+                try: self.after_cancel(self.after_id_update)
+                except: pass
+            self.destroy()
+            MainApp().mainloop()
+        else:
+            self.status.configure(text="Geçersiz veya Süresi Dolmuş Lisans!", text_color="red")
+
+# --- ANA UYGULAMA SINIFI ---
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("green")
+
+class MainApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        try:
+            self.is_admin_flag = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except:
+            self.is_admin_flag = False
+            
+        if not self.is_admin_flag:
+            messagebox.showwarning("Yetki Uyarısı ⚠️", "Uygulamayı **Yönetici Olarak** çalıştırmanız önerilir.")
+
+        self.data = load_data()
+        self.title(f"{APP_NAME} Clicker | v{APP_VERSION}")
+        self.geometry("1000x800")
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
+        
+        self.running = False
+        self.thread = None 
+        self.available_windows = [] 
+        self.click_error_logged = False 
+        self.sec_var = tk.DoubleVar(value=0.5) 
+        
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        
+        self.init_sidebar()
+        self.init_main_area()
+        self._start_background_tasks()
+        
+        self.update_announce(self.data.get('announcement', ""))
+        send_webhook("Uygulama Başladı 🟢", f"Kullanıcı **{os.getlogin()}** uygulamaya giriş yaptı.", self.data)
+        
+    def _start_background_tasks(self):
+        self.after(100, self._trigger_sys_stats)
+        self.after(100, self._trigger_user_counter)
+        
+    def _trigger_sys_stats(self):
+        threading.Thread(target=self._update_sys_stats_threaded, daemon=True).start()
+        self.after(2000, self._trigger_sys_stats) 
+
+    def _trigger_user_counter(self):
+        threading.Thread(target=self._update_active_users_counter_threaded, daemon=True).start()
+        self.after(5000, self._trigger_user_counter) 
+
+    def init_sidebar(self):
+        self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkLabel(self.sidebar, text=f"⚡ {APP_NAME}", font=("Arial", 24, "bold"), text_color="#00FF7F").pack(pady=(30,5))
+        ctk.CTkLabel(self.sidebar, text=f"FiveM Tool v{APP_VERSION}", font=("Arial", 12), text_color="gray").pack(pady=(0,30))
+        
+        self.user_count_lbl = ctk.CTkLabel(self.sidebar, text="Aktif Kullanıcı: ...", font=("Arial", 14, "bold"), text_color="#FFD700")
+        self.user_count_lbl.pack(fill="x", padx=15, pady=(10, 20))
+        
+        self.stats_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.stats_frame.pack(fill="x", padx=15, pady=10)
+        ctk.CTkLabel(self.stats_frame, text="Sistem İstatistikleri", font=("Arial", 14, "bold")).pack(fill="x", pady=(0, 10))
+        
+        # CPU Bar
+        cpu_frame = ctk.CTkFrame(self.stats_frame, fg_color="transparent")
+        cpu_frame.pack(fill="x", pady=5)
+        self.cpu_lbl_detail = ctk.CTkLabel(cpu_frame, text="CPU: 0%", anchor="w")
+        self.cpu_lbl_detail.pack(side="left", fill="x", expand=True)
+        self.cpu_bar = ctk.CTkProgressBar(cpu_frame, progress_color="#00FF7F", width=100)
+        self.cpu_bar.set(0)
+        self.cpu_bar.pack(side="right", padx=5)
+
+        # RAM Bar
+        ram_frame = ctk.CTkFrame(self.stats_frame, fg_color="transparent")
+        ram_frame.pack(fill="x", pady=5)
+        self.ram_lbl_detail = ctk.CTkLabel(ram_frame, text="RAM: 0%", anchor="w")
+        self.ram_lbl_detail.pack(side="left", fill="x", expand=True)
+        self.ram_bar = ctk.CTkProgressBar(ram_frame, progress_color="#1E90FF", width=100)
+        self.ram_bar.set(0)
+        self.ram_bar.pack(side="right", padx=5)
+
+        self.btn_admin = ctk.CTkButton(self.sidebar, text="🛡️ Yönetici Paneli", fg_color="transparent", 
+                                     border_width=1, text_color="gray", hover_color="#333333", 
+                                     command=self.open_admin)
+        self.btn_admin.pack(side="bottom", pady=20, padx=20, fill="x")
+
+    def init_main_area(self):
+        self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.main_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
+
+        self.announce_lbl = ctk.CTkLabel(self.main_frame, text="", font=("Arial", 14, "italic"), text_color="#FFD700")
+        self.announce_lbl.pack(pady=(0, 20))
+
+        # Hedef Pencere
+        window_frame = ctk.CTkFrame(self.main_frame)
+        window_frame.pack(fill="x", pady=10, padx=10)
+        ctk.CTkLabel(window_frame, text="1. Hedef Pencere", font=("Arial", 16, "bold")).pack(anchor="w", padx=15, pady=5)
+        
+        self.windows_combo = ctk.CTkComboBox(window_frame, width=400)
+        self.windows_combo.pack(side="left", padx=15, pady=10)
+        self.windows_combo.set("Yükleniyor...")
+        ctk.CTkButton(window_frame, text="🔄 Yenile", width=100, command=self.refresh_windows).pack(side="left", padx=5)
+
+        # Ayarlar
+        settings_frame = ctk.CTkFrame(self.main_frame)
+        settings_frame.pack(fill="x", pady=10, padx=10)
+        ctk.CTkLabel(settings_frame, text="2. Yapılandırma", font=("Arial", 16, "bold")).grid(row=0, column=0, sticky="w", padx=15, pady=10, columnspan=2)
+
+        ctk.CTkLabel(settings_frame, text="Tuş:").grid(row=1, column=0, padx=10, pady=10)
+        self.key_entry = ctk.CTkEntry(settings_frame, width=100)
+        self.key_entry.insert(0, "e")
+        self.key_entry.grid(row=1, column=1, padx=10, pady=10)
+
+        self.lbl_sec = ctk.CTkLabel(settings_frame, text="0.5 sn")
+        self.lbl_sec.grid(row=1, column=3)
+        
+        # DÜZELTİLEN KISIM: width grid içine değil, slider içine yazıldı.
+        self.slider = ctk.CTkSlider(settings_frame, from_=0.1, to=10.0, number_of_steps=99, variable=self.sec_var, width=200, command=lambda v: self.lbl_sec.configure(text=f"{round(v, 1)} sn"))
+        self.slider.grid(row=1, column=2, padx=10)
+
+        self.mode_var = ctk.StringVar(value="Mod 2: Odaklı (Standart)")
+        modes = ["Mod 1: Agresif (Öne Getir)", "Mod 2: Odaklı (Standart)", "Mod 3: Pasif (Arkaplan)"]
+        self.mode_combo = ctk.CTkComboBox(settings_frame, values=modes, variable=self.mode_var, width=250)
+        self.mode_combo.grid(row=2, column=0, columnspan=3, pady=10, padx=10)
+
+        # Başlat Butonu
+        self.btn_start = ctk.CTkButton(self.main_frame, text="SİSTEMİ BAŞLAT", font=("Arial", 20, "bold"), 
+                                       height=60, fg_color="#00FF7F", text_color="black", hover_color="#00D069",
+                                       command=self.toggle_clicking)
+        self.btn_start.pack(fill="x", padx=10, pady=20)
+
+        self.log_box = ctk.CTkTextbox(self.main_frame, height=150)
+        self.log_box.pack(fill="both", padx=10, pady=5, expand=True)
+        self.log("Sistem hazır.")
+        self.refresh_windows()
+
+    def update_announce(self, text):
+        self.announce_lbl.configure(text=f"📢 DUYURU: {text}")
+
+    def log(self, message):
+        try:
+            self.log_box.configure(state="normal")
+            self.log_box.insert("0.0", f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n")
+            self.log_box.configure(state="disabled")
+        except: pass
+
+    def open_admin(self):
+        AdminLogin(self, self.data)
+
+    def _update_sys_stats_threaded(self):
+        try:
+            cpu = psutil.cpu_percent(interval=None)
+            ram = psutil.virtual_memory().percent
+            self.after(0, lambda: self.cpu_bar.set(cpu / 100))
+            self.after(0, lambda: self.cpu_lbl_detail.configure(text=f"CPU: {cpu}%"))
+            self.after(0, lambda: self.ram_bar.set(ram / 100))
+            self.after(0, lambda: self.ram_lbl_detail.configure(text=f"RAM: {ram}%"))
+        except: pass
+
+    def _update_active_users_counter_threaded(self):
+        try:
+            count = fetch_active_users()
+            self.after(0, lambda: self.user_count_lbl.configure(text=f"Aktif Kullanıcı: {count}"))
+        except: pass
+
+    def refresh_windows(self):
+        self.available_windows = []
+        def enum_handler(hwnd, ctx):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                if title:
+                    self.available_windows.append((title, hwnd))
+        win32gui.EnumWindows(enum_handler, None)
+        titles = [f"{t} [{h}]" for t, h in self.available_windows]
+        if titles:
+            self.windows_combo.configure(values=titles)
+            self.windows_combo.set(titles[0])
+        else:
+            self.windows_combo.configure(values=["Pencere Bulunamadı"])
+
+    def toggle_clicking(self):
+        if not self.running:
+            key = self.key_entry.get().strip()
+            if not key: return
+            
+            selection = self.windows_combo.get()
+            hwnd = None
+            for title, h in self.available_windows:
+                if f"{title} [{h}]" == selection:
+                    hwnd = h
+                    break
+            
+            self.running = True
+            self.btn_start.configure(text="DURDUR", fg_color="#FF4500", hover_color="#8B0000")
+            self.log("İşlem Başlatıldı.")
+            send_webhook("Clicker Başlatıldı", f"Tuş: {key}", self.data)
+            
+            self.thread = threading.Thread(target=self.clicking_loop, args=(hwnd, key), daemon=True)
+            self.thread.start()
+        else:
+            self.running = False
+            self.btn_start.configure(text="SİSTEMİ BAŞLAT", fg_color="#00FF7F", hover_color="#00D069")
+            self.log("İşlem Durduruldu.")
+
+    def clicking_loop(self, target_hwnd, key):
+        mode_str = self.mode_var.get()
+        interval = self.sec_var.get()
+        while self.running:
+            try:
+                if "Mod 1" in mode_str and target_hwnd:
+                    aggressive_afk_click(target_hwnd, key)
+                elif "Mod 3" in mode_str and target_hwnd:
+                    passive_afk_click(target_hwnd, key)
+                else:
+                    direct_click(key)
+            except: pass
+            time.sleep(interval)
+
+    def close_app(self):
+        self.running = False
+        send_webhook("Uygulama Kapatıldı", "Çıkış yapıldı.", self.data)
+        self.destroy()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    try:
+        app = LoginApp()
+        app.mainloop()
+    except Exception as e:
+        ctypes.windll.user32.MessageBoxW(0, f"Hata: {str(e)}", "Hata", 0x10)
